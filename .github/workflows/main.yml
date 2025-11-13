@@ -1,0 +1,19 @@
+name: Test Runner
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  build:
+    runs-on: self-hosted   # 👈 this means it runs on your Ubuntu runner
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v3
+
+      - name: Display system info
+        run: |
+          echo "✅ Running on self-hosted Ubuntu runner"
+          uname -a
+          df -h
+          whoami
