@@ -1,4 +1,4 @@
-name: Build and Push Docker Image to ECR
+name: Build Push Deploy to ECR & EC2
 
 on:
   push:
@@ -8,67 +8,82 @@ on:
 
 env:
   AWS_REGION: ${{ secrets.AWS_REGION }}
-  ECR_REPOSITORY: ${{ secrets.ECR_REPOSITORY }}
-  DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
-  DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+  ECR_REPO: ${{ secrets.ECR_REPOSITORY }}
   EC2_HOST: ${{ secrets.EC2_HOST }}
   EC2_USER: ${{ secrets.EC2_USER }}
   EC2_SSH_KEY: ${{ secrets.EC2_SSH_KEY }}
 
 jobs:
   build-and-push:
-    name: Build and Push Docker Image to AWS ECR
     runs-on: ubuntu-latest
-
+    outputs:
+      image-tag: ${{ steps.set-tag.outputs.IMAGE_TAG }}
+      ecr-uri: ${{ steps.login-ecr.outputs.registry }}
     steps:
-      - name: Checkout repository
+      - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      - name: Log in to DockerHub
-        uses: docker/login-action@v3
-        with:
-          username: ${{ env.DOCKERHUB_USERNAME }}
-          password: ${{ env.DOCKERHUB_TOKEN }}
+      - name: Set IMAGE_TAG
+        id: set-tag
+        run: echo "IMAGE_TAG=$(echo $GITHUB_SHA | cut -c1-8)" >> $GITHUB_OUTPUT
 
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region: ${{ env.AWS_REGION }}
+          aws-region: ${{ secrets.AWS_REGION }}
 
-      - name: Login to Amazon ECR
+      - name: Login to ECR
         id: login-ecr
         uses: aws-actions/amazon-ecr-login@v2
 
-      - name: Build, tag, and push Docker image to ECR
-        env:
-          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
-          IMAGE_TAG: ${{ github.sha }}
+      - name: Build and tag Docker image
         run: |
-          docker build -t $ECR_REGISTRY/${{ env.ECR_REPOSITORY }}:$IMAGE_TAG .
-          docker push $ECR_REGISTRY/${{ env.ECR_REPOSITORY }}:$IMAGE_TAG
-          echo "IMAGE_URL=$ECR_REGISTRY/${{ env.ECR_REPOSITORY }}:$IMAGE_TAG" >> $GITHUB_ENV
+          echo "ECR registry: ${{ steps.login-ecr.outputs.registry }}"
+          docker build -t ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPO }}:${{ steps.set-tag.outputs.IMAGE_TAG }} -f ./Dockerfile .
+          docker images --format "table {{.Repository}}\t{{.Tag}}\t{{.ID}}"
+
+      - name: Push image to ECR
+        run: |
+          docker push ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPO }}:${{ steps.set-tag.outputs.IMAGE_TAG }}
 
   deploy:
-    name: Deploy to EC2
     needs: build-and-push
     runs-on: ubuntu-latest
-
     steps:
-      - name: SSH into EC2 and deploy container
-        uses: appleboy/ssh-action@v1.0.3
+      - name: Deploy to EC2 via SSH
+        uses: appleboy/ssh-action@v1
         with:
           host: ${{ env.EC2_HOST }}
           username: ${{ env.EC2_USER }}
           key: ${{ env.EC2_SSH_KEY }}
           script: |
-            echo "Pulling latest Docker image..."
-            aws ecr get-login-password --region ${{ env.AWS_REGION }} | docker login --username AWS --password-stdin $(aws sts get-caller-identity --query "Account" --output text).dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com
+            set -e
+            echo "Ensure docker and aws cli are present and start docker"
+            sudo systemctl enable --now docker || true
+            if ! command -v aws >/dev/null 2>&1; then
+              echo "Installing awscli"
+              curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o /tmp/awscliv2.zip
+              sudo apt-get update -y
+              sudo apt-get install -y unzip
+              unzip /tmp/awscliv2.zip -d /tmp
+              sudo /tmp/aws/install
+            fi
 
-            docker pull ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ github.sha }}
-            docker stop app || true && docker rm app || true
-            docker run -d --name app -p 80:80 ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ github.sha }}
+            # Login to ECR on the EC2 host
+            AWS_REGION="${{ secrets.AWS_REGION }}"
+            ECR_REGISTRY="${{ steps.login-ecr.outputs.registry }}"
+            IMAGE="${ECR_REGISTRY}/${{ env.ECR_REPO }}:${{ steps.set-tag.outputs.IMAGE_TAG }}"
+
+            aws ecr get-login-password --region "$AWS_REGION" | docker login --username AWS --password-stdin "$ECR_REGISTRY"
+
+            echo "Pulling $IMAGE"
+            docker pull "$IMAGE"
+
+            echo "Stopping existing container (if any)"
+            docker stop myapp || true
+            docker rm myapp || true
+
+            echo "Running new container"
+            docker run -d --restart unless-stopped -p 80:80 --name myapp "$IMAGE"
